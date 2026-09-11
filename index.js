@@ -1,3 +1,253 @@
+app.get('/health', (req, res) => {
+  res.json({
+    status: botState.connected ? 'connected' : 'disconnected',
+    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
+    coords: (bot && bot.entity) ? bot.entity.position : null,
+    lastActivity: botState.lastActivity,
+    reconnectAttempts: botState.reconnectAttempts,
+    memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024
+  });
+});
+
+app.get('/ping', (req, res) => res.send('pong'));
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Server] HTTP server started on port ${PORT}`);
+});
+
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${h}h ${m}m ${s}s`;
+}
+
+// ============================================================
+// SELF-PING - Prevent Render from sleeping
+// ============================================================
+const SELF_PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
+
+const https = require('https');
+
+function startSelfPing() {
+  setInterval(() => {
+    const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const protocol = url.startsWith('https') ? https : http;
+
+    protocol.get(`${url}/ping`, (res) => {
+      // console.log(`[KeepAlive] Self-ping: ${res.statusCode}`); // Optional: reduce spam
+    }).on('error', (err) => {
+      console.log(`[KeepAlive] Self-ping failed: ${err.message}`);
+    });
+  }, SELF_PING_INTERVAL);
+  console.log('[KeepAlive] Self-ping system started (every 10 min)');
+}
+
+startSelfPing();
+
+// ============================================================
+// MEMORY MONITORING
+// ============================================================
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(2);
+  console.log(`[Memory] Heap: ${heapMB} MB`);
+}, 5 * 60 * 1000); // Every 5 minutes
+
+// ============================================================
+// BOT CREATION WITH RECONNECTION LOGIC
+// ============================================================
+let bot = null;
+let activeIntervals = [];
+let reconnectTimeout = null;
+let isReconnecting = false;
+
+function clearAllIntervals() {
+  console.log(`[Cleanup] Clearing ${activeIntervals.length} intervals`);
+  activeIntervals.forEach(id => clearInterval(id));
+  activeIntervals = [];
+}
+
+function addInterval(callback, delay) {
+  const id = setInterval(callback, delay);
+  activeIntervals.push(id);
+  return id;
+}
+
+function getReconnectDelay() {
+  // Aggressive reconnection: fast, flat delay or very subtle backoff
+  const baseDelay = config.utils['auto-reconnect-delay'] || 2000;
+  const maxDelay = config.utils['max-reconnect-delay'] || 15000;
+
+  // Use a much gentler backoff or just a flat delay if user wants "lower"
+  // Current logic: attempts * 1000 + base, capped at max
+  const delay = Math.min(baseDelay + (botState.reconnectAttempts * 1000), maxDelay);
+
+  return delay;
+}
+
+function createBot() {
+  if (isReconnecting) {
+    console.log('[Bot] Already reconnecting, skipping...');
+    return;
+  }
+
+  // Cleanup previous bot
+  if (bot) {
+    clearAllIntervals();
+    try {
+      bot.removeAllListeners();
+      bot.end();
+    } catch (e) {
+      console.log('[Cleanup] Error ending previous bot:', e.message);
+    }
+    bot = null;
+  }
+
+  console.log(`[Bot] Creating bot instance...`);
+  console.log(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
+
+  try {
+    bot = mineflayer.createBot({
+      username: config['bot-account'].username,
+      password: config['bot-account'].password || undefined,
+      auth: config['bot-account'].type,
+      host: config.server.ip,
+      port: config.server.port,
+      version: config.server.version,
+      hideErrors: false,
+      checkTimeoutInterval: 120000 // 2 minutes - detects dead connections without false-positive disconnects
+    });
+
+    bot.loadPlugin(pathfinder);
+
+    // Connection timeout - if no spawn in 60s, reconnect
+    const connectionTimeout = setTimeout(() => {
+      if (!botState.connected) {
+        console.log('[Bot] Connection timeout - no spawn received');
+        scheduleReconnect();
+      }
+    }, 60000);
+
+    bot.once('spawn', () => {
+  clearTimeout(connectionTimeout);
+  botState.connected = true;
+  botState.lastActivity = Date.now();
+  botState.reconnectAttempts = 0;
+  isReconnecting = false;
+
+  console.log(`[Bot] [+] Successfully spawned on server!`);
+
+  // ðŸ” FORCE LOGIN SYSTEM (Perzaan Edition)
+
+      bot.on('messagestr', (msg) => {
+  const message = msg.toLowerCase();
+
+  // Login
+  if (message.includes('login')) {
+    bot.chat('/login Perzuu');
+    console.log('[Auth] Login detected');
+  }
+
+  // Register
+  if (message.includes('register')) {
+    bot.chat('/register Perzuu Perzuu');
+    console.log('[Auth] Register detected');
+  }
+
+  // Creative mode success
+  if (
+    message.includes('commands.gamemode.success.self') ||
+    message.includes('set own game mode to creative mode')
+  ) {
+    console.log('[INFO] Bot is now in Creative Mode.');
+
+    bot.chat('/gamerule sendCommandFeedback false');
+  }
+});
+
+      if (config.discord && config.discord.events.connect) {
+  sendDiscordWebhook(`[+] **Connected** to \`${config.server.ip}\``, 0x4ade80);
+}
+
+const mcData = require('minecraft-data')(config.server.version);
+const defaultMove = new Movements(bot, mcData);
+
+initializeModules(bot, mcData, defaultMove);
+setupLeaveRejoin(bot, createBot);
+
+setTimeout(() => {
+  if (bot && botState.connected) {
+    bot.chat('/gamerule sendCommandFeedback false');
+  }
+}, 3000);
+
+setTimeout(() => {
+  if (bot && botState.connected) {
+    bot.chat('/gamemode creative');
+    console.log('[INFO] Attempted to set creative mode (requires OP)');
+  }
+}, 3000);
+
+});
+
+    // Handle disconnection
+    bot.on('end', (reason) => {
+      const wasSpawned = botState.connected;
+      console.log(`[Bot] Disconnected: ${reason || 'Unknown reason'}`);
+      botState.connected = false;
+      clearAllIntervals();
+
+      if (config.discord && config.discord.events.disconnect && reason !== 'Periodic Rejoin') {
+        sendDiscordWebhook(`[-] **Disconnected**: ${reason || 'Unknown'}`, 0xf87171); // Red
+      }
+
+      if (config.utils['auto-reconnect']) {
+        scheduleReconnect();
+      }
+    });
+
+    bot.on("kicked", (reason) => {
+    console.log(
+        "[KICK]",
+        typeof reason === "string"
+            ? reason
+            : JSON.stringify(reason, null, 2)
+    );
+});
+
+    bot.on('error', (err) => {
+      console.log(`[Bot] Error: ${err.message}`);
+      botState.errors.push({ type: 'error', message: err.message, time: Date.now() });
+      // Don't immediately reconnect on error - let 'end' event handle it
+    });
+
+  } catch (err) {
+    console.log(`[Bot] Failed to create bot: ${err.message}`);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+  }
+
+  if (isReconnecting) {
+    return;
+  }
+
+  isReconnecting = true;
+  botState.reconnectAttempts++;
+
+  const delay = getReconnectDelay();
+  console.log(`[Bot] Reconnecting in ${delay / 1000}s (attempt #${botState.reconnectAttempts})`);
+
+  reconnectTimeout = setTimeout(() => {
+    isReconnecting = false;
+    createBot();
+  }, delay);
+}
 
 ;
 
@@ -472,48 +722,444 @@ ccount'].username, username: contig bot-account password: d: contig! bot-account
 
 auth: config['bot-account'].type,
 
-host: config.server.ip. port: config.server.port.
+host: config.server.ip. port
+app.get('/health', (req, res) => {
+  res.json({
+    status: botState.connected ? 'connected' : 'disconnected',
+    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
+    coords: (bot && bot.entity) ? bot.entity.position : null,
+    lastActivity: botState.lastActivity,
+    reconnectAttempts: botState.reconnectAttempts,
+    memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024
+  });
+});
 
-version: config.server.version, hideErrors: false,
+app.get('/ping', (req, res) => res.send('pong'));
 
-1) checkTimeout Interval: 120000 // 2 minutes detects dead connections without false-positive disconnects
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Server] HTTP server started on port ${PORT}`);
+});
 
-bot.loadPlugin(pathfinder);
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${h}h ${m}m ${s}s`;
+}
 
-// Connection timeout if no spawn in 60s, reconnect onst connectionTimeout setTimeout(() => {
+// ============================================================
+// SELF-PING - Prevent Render from sleeping
+// ============================================================
+const SELF_PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
 
-if (!botState.connected) ( console.log('[Bot] Connection timeout scheduleReconnect(); spawn received');
+const https = require('https');
 
-}, 60000);
+function startSelfPing() {
+  setInterval(() => {
+    const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const protocol = url.startsWith('https') ? https : http;
 
-bot.once('spawn', () => { clearTimeout(connectionTimeout); botState.connected true;
+    protocol.get(`${url}/ping`, (res) => {
+      // console.log(`[KeepAlive] Self-ping: ${res.statusCode}`); // Optional: reduce spam
+    }).on('error', (err) => {
+      console.log(`[KeepAlive] Self-ping failed: ${err.message}`);
+    });
+  }, SELF_PING_INTERVAL);
+  console.log('[KeepAlive] Self-ping system started (every 10 min)');
+}
 
-botState.lastActivity Date.now(); botState.reconnectAttempts = 0; isReconnecting false;
+startSelfPing();
 
-console.log('[Bot] [+] Successfully spawned on server!');
+// ============================================================
+// MEMORY MONITORING
+// ============================================================
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(2);
+  console.log(`[Memory] Heap: ${heapMB} MB`);
+}, 5 * 60 * 1000); // Every 5 minutes
 
-// BY FORCE LOGIN SYSTEM (Perzaan Edition)
+// ============================================================
+// BOT CREATION WITH RECONNECTION LOGIC
+// ============================================================
+let bot = null;
+let activeIntervals = [];
+let reconnectTimeout = null;
+let isReconnecting = false;
 
-bot.on('messagestr, (msg) { const nessage msg.toLowerCase();
+function clearAllIntervals() {
+  console.log(`[Cleanup] Clearing ${activeIntervals.length} intervals`);
+  activeIntervals.forEach(id => clearInterval(id));
+  activeIntervals = [];
+}
 
-//if (message.includes('login')) {
+function addInterval(callback, delay) {
+  const id = setInterval(callback, delay);
+  activeIntervals.push(id);
+  return id;
+}
 
-bot.chat('/login Perzuu'); console.log("[Auth] Login detected');
+function getReconnectDelay() {
+  // Aggressive reconnection: fast, flat delay or very subtle backoff
+  const baseDelay = config.utils['auto-reconnect-delay'] || 2000;
+  const maxDelay = config.utils['max-reconnect-delay'] || 15000;
 
-// Register if (message.includes('register")) { bot.chat('/register Perzuu Perzuu');
+  // Use a much gentler backoff or just a flat delay if user wants "lower"
+  // Current logic: attempts * 1000 + base, capped at max
+  const delay = Math.min(baseDelay + (botState.reconnectAttempts * 1000), maxDelay);
 
-console.log("[Auth] Register detected');
+  return delay;
+}
 
-)
+function createBot() {
+  if (isReconnecting) {
+    console.log('[Bot] Already reconnecting, skipping...');
+    return;
+  }
+
+  // Cleanup previous bot
+  if (bot) {
+    clearAllIntervals();
+    try {
+      bot.removeAllListeners();
+      bot.end();
+    } catch (e) {
+      console.log('[Cleanup] Error ending previous bot:', e.message);
+    }
+    bot = null;
+  }
+
+  console.log(`[Bot] Creating bot instance...`);
+  console.log(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
+
+  try {
+    bot = mineflayer.createBot({
+      username: config['bot-account'].username,
+      password: config['bot-account'].password || undefined,
+      auth: config['bot-account'].type,
+      host: config.server.ip,
+      port: config.server.port,
+      version: config.server.version,
+      hideErrors: false,
+      checkTimeoutInterval: 120000 // 2 minutes - detects dead connections without false-positive disconnects
+    });
+
+    bot.loadPlugin(pathfinder);
+
+    // Connection timeout - if no spawn in 60s, reconnect
+    const connectionTimeout = setTimeout(() => {
+      if (!botState.connected) {
+        console.log('[Bot] Connection timeout - no spawn received');
+        scheduleReconnect();
+      }
+    }, 60000);
+
+    bot.once('spawn', () => {
+  clearTimeout(connectionTimeout);
+  botState.connected = true;
+  botState.lastActivity = Date.now();
+  botState.reconnectAttempts = 0;
+  isReconnecting = false;
+
+  console.log(`[Bot] [+] Successfully spawned on server!`);
+
+  // ðŸ” FORCE LOGIN SYSTEM (Perzaan Edition)
+
+      bot.on('messagestr', (msg) => {
+  const message = msg.toLowerCase();
+
+  // Login
+  if (message.includes('login')) {
+    bot.chat('/login Perzuu');
+    console.log('[Auth] Login detected');
+  }
+
+  // Register
+  if (message.includes('register')) {
+    bot.chat('/register Perzuu Perzuu');
+    console.log('[Auth] Register detected');
+  }
+
+  // Creative mode success
+  if (
+    message.includes('commands.gamemode.success.self') ||
+    message.includes('set own game mode to creative mode')
+  ) {
+    console.log('[INFO] Bot is now in Creative Mode.');
+
+    bot.chat('/gamerule sendCommandFeedback false');
+  }
+});
+
+      if (config.discord && config.discord.events.connect) {
+  sendDiscordWebhook(`[+] **Connected** to \`${config.server.ip}\``, 0x4ade80);
+}
+
+const mcData = require('minecraft-data')(config.server.version);
+const defaultMove = new Movements(bot, mcData);
+
+initializeModules(bot, mcData, defaultMove);
+setupLeaveRejoin(bot, createBot);
+
+setTimeout(() => {
+  if (bot && botState.connected) {
+    bot.chat('/gamerule sendCommandFeedback false');
+  }
+}, 3000);
+
+setTimeout(() => {
+  if (bot && botState.connected) {
+    bot.chat('/gamemode creative');
+    console.log('[INFO] Attempted to set creative mode (requires OP)');
+  }
+}, 3000);
 
 });
 
-Creative mode success
+    // Handle disconnection
+    bot.on('end', (reason) => {
+      const wasSpawned = botState.connected;
+      console.log(`[Bot] Disconnected: ${reason || 'Unknown reason'}`);
+      botState.connected = false;
+      clearAllIntervals();
 
-message.includes("commands.gamemode.success.self") nessage.includes('set own gane mode to creative mode
+      if (config.discord && config.discord.events.disconnect && reason !== 'Periodic Rejoin') {
+        sendDiscordWebhook(`[-] **Disconnected**: ${reason || 'Unknown'}`, 0xf87171); // Red
+      }
 
-console.log('[INFO] Bot is now in Creative Mode.");
+      if (config.utils['auto-reconnect']) {
+        scheduleReconnect();
+      }
+    });
 
-bot.chat('/gamerule sendCommandFeedback false");
+    bot.on("kicked", (reason) => {
+    console.log(
+        "[KICK]",
+        typeof reason === "string"
+            ? reason
+            : JSON.stringify(reason, null, 2)
+    );
+});
 
-if (config.discord && config.discord.events.connect) ( sendDiscordwebhook([+] **Connected to $(config.server.ip)\, 0x4ade80);
+    bot.on('error', (err) => {
+      console.log(`[Bot] Error: ${err.message}`);
+      botState.errors.push({ type: 'error', message: err.message, time: Date.now() });
+      // Don't immediately reconnect on error - let 'end' event handle it
+    });
+
+  } catch (err) {
+    console.log(`[Bot] Failed to create bot: ${err.message}`);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+  }
+
+  if (isReconnecting) {
+    return;
+  }
+
+  isReconnecting = true;
+  botState.reconnectAttempts++;
+
+  const delay = getReconnectDelay();
+  console.log(`[Bot] Reconnecting in ${delay / 1000}s (attempt #${botState.reconnectAttempts})`);
+
+  reconnectTimeout = setTimeout(() => {
+    isReconnecting = false;
+    createBot();
+  }, delay);
+  }
+            return itemData && itemData.food;
+        });
+        if (food) {
+          bot.equip(food, 'hand')
+            .then(() => bot.consume())
+            .catch(e => console.log('[AutoEat] Error:', e.message));
+        }
+      }
+    } catch (e) {
+      console.log('[AutoEat] Error:', e.message);
+    }
+  });
+}
+
+// Bed module (FIXED - beds are blocks, not entities)
+function bedModule(bot, mcData) {
+  addInterval(async () => {
+    if (!bot || !botState.connected) return;
+
+    try {
+      const isNight = bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
+
+      if (config.beds['place-night'] && isNight && !bot.isSleeping) {
+        // Find nearby bed blocks
+        const bedBlock = bot.findBlock({
+          matching: block => block.name.includes('bed'),
+          maxDistance: 8
+        });
+
+        if (bedBlock) {
+          try {
+            await bot.sleep(bedBlock);
+            console.log('[Bed] Sleeping...');
+          } catch (e) {
+            // Can't sleep - maybe not night enough or monsters nearby
+          }
+        }
+      }
+    } catch (e) {
+      console.log('[Bed] Error:', e.message);
+    }
+  }, 10000);
+}
+
+// Chat module
+function chatModule(bot) {
+  bot.on('chat', (username, message) => {
+    if (!bot || username === bot.username) return;
+
+    try {
+      if (config.chat.respond) {
+        const lowerMsg = message.toLowerCase();
+        if (lowerMsg.includes('hello') || lowerMsg.includes('hi')) {
+          bot.chat(`Hello, ${username}!`);
+        }
+        if (message.startsWith('!tp ') && config.chat.respond) {
+          const target = message.split(' ')[1];
+          if (target) bot.chat(`/tp ${target}`);
+        }
+      }
+    } catch (e) {
+      console.log('[Chat] Error:', e.message);
+    }
+  });
+                        }============================================================
+// CONSOLE COMMANDS
+// ============================================================
+const readline = require('readline');
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+});
+
+rl.on('line', (line) => {
+  if (!bot || !botState.connected) {
+    console.log('[Console] Bot not connected');
+    return;
+  }
+
+  const trimmed = line.trim();
+  if (trimmed.startsWith('say ')) {
+    bot.chat(trimmed.slice(4));
+  } else if (trimmed.startsWith('cmd ')) {
+    bot.chat('/' + trimmed.slice(4));
+  } else if (trimmed === 'status') {
+    console.log(`Connected: ${botState.connected}, Uptime: ${formatUptime(Math.floor((Date.now() - botState.startTime) / 1000))}`);
+  } else if (trimmed === 'reconnect') {
+    console.log('[Console] Manual reconnect requested');
+    bot.end();
+  } else {
+    bot.chat(trimmed);
+  }
+});
+
+// ============================================================
+// DISCORD WEBHOOK INTEGRATION
+// ============================================================
+function sendDiscordWebhook(content, color = 0x0099ff) {
+  if (!config.discord || !config.discord.enabled || !config.discord.webhookUrl || config.discord.webhookUrl.includes('YOUR_DISCORD')) return;
+
+  const protocol = config.discord.webhookUrl.startsWith('https') ? https : http;
+  const urlParts = new URL(config.discord.webhookUrl);
+
+  const payload = JSON.stringify({
+    username: config.name,
+    embeds: [{
+      description: content,
+      color: color,
+      timestamp: new Date().toISOString(),
+      footer: { text: 'Slobos AFK Bot' }
+    }]
+  });
+
+  const options = {
+    hostname: urlParts.hostname,
+    port: 443,
+    path: urlParts.pathname + urlParts.search,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': payload.length
+    }
+  };
+
+  const req = protocol.request(options, (res) => {
+    // console.log(`[Discord] Sent webhook: ${res.statusCode}`);
+  });
+
+  req.on('error', (e) => {
+    console.log(`[Discord] Error sending webhook: ${e.message}`);
+  });
+
+  req.write(payload);
+  req.end();
+}
+
+// ============================================================
+// CRASH RECOVERY - IMMORTAL MODE
+// ============================================================
+process.on('uncaughtException', (err) => {
+  console.log(`[FATAL] Uncaught Exception: ${err.message}`);
+  // console.log(err.stack); // Optional: keep logs cleaner
+  botState.errors.push({ type: 'uncaught', message: err.message, time: Date.now() });
+
+  // CRITICAL: DO NOT EXIT.
+  // The user wants the server to stay up "all the time no matter what".
+  // We just clear intervals and try to restart the bot logic.
+  if (config.utils['auto-reconnect']) {
+    clearAllIntervals();
+    // Wrap in a tiny timeout to prevent tight loops if the error is synchronous
+    setTimeout(() => {
+      scheduleReconnect();
+    }, 1000);
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.log(`[FATAL] Unhandled Rejection: ${reason}`);
+  botState.errors.push({ type: 'rejection', message: String(reason), time: Date.now() });
+  // Do not exit.
+});
+
+// Graceful shutdown from external signals (still allowed to exit if system demands it)
+process.on('SIGTERM', () => {
+  console.log('[System] SIGTERM received. Ignoring to stay alive? (Render might force kill)');
+  // If we mistakenly exit here, the web server dies. 
+  // User asked for "all the time on no matter what".
+  // Note: Render will SIGKILL if we don't exit, but this keeps us up as long as possible.
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  // Local Ctrl+C
+  console.log('[System] Manual stop requested. Exiting...');
+  process.exit(0);
+});
+
+// ============================================================
+// START THE BOT
+// ============================================================
+console.log('='.repeat(50));
+console.log('  Minecraft AFK Bot v2.3 - Bug Fix Edition');
+console.log('='.repeat(50));
+console.log(`Server: ${config.server.ip}:${config.server.port}`);
+console.log(`Version: ${config.server.version}`);
+console.log(`Auto-Reconnect: ${config.utils['auto-reconnect'] ? 'Enabled' : 'Disabled'}`);
+console.log('='.repeat(50));
+
+createBot();
